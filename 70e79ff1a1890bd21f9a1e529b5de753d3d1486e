@@ -1,0 +1,5 @@
+Why not a plugin?
+
+The TUI plugin system exposes slots (render injection points). The only slots available are session_prompt and session_prompt_right. There is no slot for tool rendering. The Shell component and the permission prompt's bash branch are hardcoded component trees with no extension point. A plugin has no way to intercept or transform the command string before it's rendered.
+
+This is a display concern, not a feature. It belongs in the rendering layer. If pluggability is desired later, a tool_display_transform hook could be added to the plugin API.
