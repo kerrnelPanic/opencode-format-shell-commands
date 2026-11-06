@@ -1,235 +1,59 @@
+import { parse, type Program, type Statement } from "@aliou/sh"
+
 /**
- * Formats a shell command for display by inserting line breaks at top-level
- * shell operators (;, |, &&, ||, ;;, |&). Only applies when the command
- * exceeds `threshold` characters. Continuation lines are indented two spaces.
+ * Formats a shell command for display by inserting line breaks after
+ * top-level separators (`;`, `&&`, `||`, `|`) of commands longer than
+ * `threshold` characters. Continuation lines are indented two spaces.
  *
- * Quote-aware: will not split inside single/double quotes, backticks,
- * shell comments, arithmetic expansion $((...)), or heredoc bodies.
+ * Purely additive: only line breaks with indentation are inserted, the
+ * original text is never altered, so the result always contains exactly the
+ * command that will run. Operators inside quotes, parameter expansion
+ * (`${#…}`), command substitution, subshells, or heredocs are not top-level
+ * and never split. Commands that fail to parse are returned unchanged.
  */
 export function formatShellCommand(command: string, threshold = 60): string {
   if (command.length <= threshold) return command
-  return format(tokenize(command))
+  let breaks: number[]
+  try {
+    breaks = [...topLevelBreaks(parse(command).ast, command)]
+  } catch {
+    return command
+  }
+  let out = command
+  for (let i = breaks.length - 1; i >= 0; i--) out = out.slice(0, breaks[i]) + "\n  " + out.slice(breaks[i])
+  return out
 }
 
-type Token =
-  | { kind: "text"; value: string }
-  | { kind: "op"; value: string }
-  | { kind: "newline" }
-  | { kind: "heredoc"; value: string }
-
-function tokenize(command: string): Token[] {
-  const s = new Scanner(command)
-  const tokens: Token[] = []
-  let text = ""
-  let quote: "'" | '"' | "`" | null = null
-  let inComment = false
-  let heredocDelim: string | null = null
-  let arithDepth = 0
-
-  const flush = () => {
-    if (text) {
-      tokens.push({ kind: "text", value: text })
-      text = ""
-    }
-  }
-
-  while (!s.done) {
-    if (inComment) {
-      if (s.char === "\n") {
-        inComment = false
-        flush()
-        tokens.push({ kind: "newline" })
-      } else {
-        text += s.char
+/** Insertion offsets, generated in ascending order. Nodes without position info never break. */
+function* topLevelBreaks(node: Program | Statement, source: string): Generator<number> {
+  if (node.type === "Program") {
+    let prev: Statement | undefined
+    for (const stmt of node.body) {
+      // Only `;`-separated statements break; existing newlines already break,
+      // and background `&` was never a break point.
+      const at = stmt.pos?.offset
+      if (prev && at !== undefined) {
+        const gap = source.slice(prev.end?.offset ?? at, at)
+        if (gap.includes(";") && !gap.includes("\n")) yield at
       }
-      s.advance()
-      continue
+      prev = stmt
+      yield* topLevelBreaks(stmt, source)
     }
-
-    if (quote) {
-      text += s.char
-      // Backslash escapes in double quotes and backticks, not single quotes
-      if (quote !== "'" && s.char === "\\" && s.peek() !== undefined) {
-        text += s.peek()
-        s.advance(2)
-        continue
-      }
-      if (s.char === quote) quote = null
-      s.advance()
-      continue
-    }
-
-    if (s.char === "'" || s.char === '"' || s.char === "`") {
-      quote = s.char
-      text += s.char
-      s.advance()
-      continue
-    }
-
-    if (s.char === "\\" && s.peek() !== undefined) {
-      text += s.char + s.peek()
-      s.advance(2)
-      continue
-    }
-
-    if (s.char === "\n") {
-      flush()
-      tokens.push({ kind: "newline" })
-      s.advance()
-      if (heredocDelim) {
-        tokens.push(...readHeredocBody(s, heredocDelim))
-        heredocDelim = null
-      }
-      continue
-    }
-
-    // # at a word boundary starts a comment
-    if (s.char === "#" && (s.i === 0 || /[;|&(){}\s]/.test(s.prev))) {
-      inComment = true
-      text += s.char
-      s.advance()
-      continue
-    }
-
-    if (s.char === "<" && s.peek() === "<") {
-      const delim = readHeredocDelim(s.command, s.i)
-      if (delim) {
-        heredocDelim = delim.value
-        text += s.slice(delim.end)
-        s.i = delim.end
-        continue
-      }
-    }
-
-    if (s.char === "$" && s.peek() === "(" && s.peek(2) === "(") {
-      arithDepth++
-      text += "$(("
-      s.advance(3)
-      continue
-    }
-
-    if (s.char === ")" && s.peek() === ")" && arithDepth > 0) {
-      arithDepth--
-      text += "))"
-      s.advance(2)
-      continue
-    }
-
-    const two = s.take(2)
-    if (two === "&&" || two === "||" || two === ";;" || two === "|&") {
-      // && and || are arithmetic operators inside $((...))
-      if (arithDepth > 0 && (two === "&&" || two === "||")) {
-        text += two
-        s.advance(2)
-        continue
-      }
-      flush()
-      tokens.push({ kind: "op", value: two })
-      s.advance(2)
-      s.skipSpaces()
-      continue
-    }
-
-    if (s.char === ";" || s.char === "|") {
-      flush()
-      tokens.push({ kind: "op", value: s.char })
-      s.advance()
-      s.skipSpaces()
-      continue
-    }
-
-    text += s.char
-    s.advance()
+    return
   }
-
-  flush()
-  return tokens
-}
-
-function format(tokens: Token[]): string {
-  const lines: string[] = []
-  let current = ""
-
-  const flushLine = () => {
-    const trimmed = current.trimEnd()
-    if (trimmed) lines.push(trimmed)
-    current = ""
-  }
-
-  for (const token of tokens) {
-    if (token.kind === "op") {
-      current += token.value
-      lines.push(current.trimEnd())
-      current = "  "
-    } else if (token.kind === "newline" || token.kind === "heredoc") {
-      flushLine()
-      if (token.kind === "heredoc") lines.push(token.value)
-    } else {
-      current += token.value
+  const cmd = node.command
+  if (cmd.type === "Logical") {
+    yield* topLevelBreaks(cmd.left, source)
+    const at = cmd.right.pos?.offset
+    if (at !== undefined && !source.slice(cmd.left.end?.offset ?? at, at).includes("\n")) yield at
+    yield* topLevelBreaks(cmd.right, source)
+  } else if (cmd.type === "Pipeline") {
+    let prev: Statement | undefined
+    for (const part of cmd.commands) {
+      const at = part.pos?.offset
+      if (prev && at !== undefined && !source.slice(prev.end?.offset ?? at, at).includes("\n")) yield at
+      prev = part
+      yield* topLevelBreaks(part, source)
     }
   }
-
-  flushLine()
-  return lines.join("\n")
-}
-
-class Scanner {
-  i = 0
-  constructor(readonly command: string) {}
-
-  get char() {
-    return this.command[this.i]
-  }
-  get done() {
-    return this.i >= this.command.length
-  }
-  get prev() {
-    return this.command[this.i - 1]
-  }
-
-  peek(offset = 1) {
-    return this.command[this.i + offset]
-  }
-  take(n: number) {
-    return this.command.slice(this.i, this.i + n)
-  }
-  slice(end: number) {
-    return this.command.slice(this.i, end)
-  }
-  advance(n = 1) {
-    this.i += n
-  }
-  skipSpaces() {
-    while (this.i < this.command.length && this.command[this.i] === " ") this.i++
-  }
-}
-
-/** Parses a heredoc delimiter (<<DELIM, <<-DELIM, <<'DELIM') starting at `start`. */
-function readHeredocDelim(command: string, start: number): { value: string; end: number } | null {
-  let j = start + 2
-  if (command[j] === "-") j++
-  const delimQuote = command[j] === "'" || command[j] === '"' ? command[j] : null
-  if (delimQuote) j++
-  let delim = ""
-  while (j < command.length && /[a-zA-Z0-9_]/.test(command[j])) {
-    delim += command[j]
-    j++
-  }
-  if (delimQuote && command[j] === delimQuote) j++
-  if (!delim) return null
-  return { value: delim, end: j }
-}
-
-/** Reads heredoc body lines from the scanner until `delim` is found. Advances `s.i`. */
-function readHeredocBody(s: Scanner, delim: string): Token[] {
-  const tokens: Token[] = []
-  while (!s.done) {
-    const j = s.command.indexOf("\n", s.i)
-    const end = j === -1 ? s.command.length : j
-    const line = s.command.slice(s.i, end)
-    tokens.push({ kind: "heredoc", value: line })
-    s.i = j === -1 ? s.command.length : j + 1
-    if (line.trim() === delim) break
-  }
-  return tokens
 }

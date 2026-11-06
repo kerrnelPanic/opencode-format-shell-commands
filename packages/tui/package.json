@@ -49,6 +49,7 @@
     }
   },
   "dependencies": {
+    "@aliou/sh": "0.3.4",
     "@opencode/client": "workspace:*",
     "@opencode/core": "workspace:*",
     "@opencode/latex": "workspace:*",
